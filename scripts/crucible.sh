@@ -14,8 +14,12 @@ if [[ ! -f "$KEY" ]]; then
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$KEY"
 fi
 
-# Use existing test image or fallback
-SRC="${1:-Agudas_Achim_Sisterhood_Site_Image_1.jpg}"
+# Require image path
+if [[ -z "$1" ]]; then
+  echo "Usage: $0 <image.jpg>"
+  exit 1
+fi
+SRC="$1"
 if [[ ! -f "$SRC" ]]; then
   echo "ERROR: Source image not found: $SRC"
   exit 1

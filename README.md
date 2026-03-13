@@ -131,7 +131,7 @@ If extraction succeeds, the watermark survives JPEG 75%.
 Runs 8 torture tests: PNG baseline, JPEG 75%/85%/95%, crop 400×400, crop 360×360, crop+JPEG, resize 70%.
 
 ```bash
-./scripts/crucible.sh [image.jpg]
+./scripts/crucible.sh <image.jpg>
 ```
 
 Requires ImageMagick (`magick` or `convert`). **Baseline:** A (PNG) and F (JPEG 95%) must pass. Crop and resize tests may fail due to DWT boundary effects and interpolation—this documents known limits.

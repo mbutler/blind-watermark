@@ -49,7 +49,8 @@ impl WatermarkEngine {
         DwtEngine::inverse_2d(y_channel, width, height);
     }
 
-    /// Extracts payload from the Y channel. Runs DWT, reads from HL band.
+    /// Extracts payload chunks from the Y channel. Runs DWT, reads from HL band.
+    /// Returns multiple 58-byte chunks (spatial repetition); caller tries each until one passes CRC32.
     /// Requires &mut because it performs the forward DWT in place.
     pub fn extract(
         &self,
@@ -57,7 +58,7 @@ impl WatermarkEngine {
         width: usize,
         height: usize,
         expected_bytes: usize,
-    ) -> Vec<Option<u8>> {
+    ) -> Vec<Vec<Option<u8>>> {
         let w = width & !1;
         let h = height & !1;
         let half_w = w / 2;
@@ -74,7 +75,7 @@ impl WatermarkEngine {
             }
         }
 
-        // 3. Extract payload from the HL band
+        // 3. Extract all payload chunks from the HL band (hologram-style repetition)
         self.extract_dct_blocks(&hl_band, half_w, half_h, expected_bytes)
     }
 
@@ -92,17 +93,15 @@ impl WatermarkEngine {
             }
         }
 
+        let total_bits = bits.len();
         let blocks_x = width / 8;
         let blocks_y = height / 8;
-        let mut bit_index = 0;
+        let mut block_index = 0;
 
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
-                if bit_index >= bits.len() {
-                    return;
-                }
-
                 let mut block = [0.0; 64];
+
                 for r in 0..8 {
                     for c in 0..8 {
                         let px = (by * 8 + r) * width + (bx * 8 + c);
@@ -111,9 +110,13 @@ impl WatermarkEngine {
                 }
 
                 self.dct.forward_2d(&mut block);
+
+                // Loop the payload; every 464-block chunk contains the full identity
+                let current_bit = bits[block_index % total_bits];
                 block[self.target_coeff] =
-                    self.qim.embed_bit(block[self.target_coeff], bits[bit_index]);
-                bit_index += 1;
+                    self.qim.embed_bit(block[self.target_coeff], current_bit);
+                block_index += 1;
+
                 self.dct.inverse_2d(&mut block);
 
                 for r in 0..8 {
@@ -132,19 +135,17 @@ impl WatermarkEngine {
         width: usize,
         height: usize,
         expected_bytes: usize,
-    ) -> Vec<Option<u8>> {
+    ) -> Vec<Vec<Option<u8>>> {
         let expected_bits = expected_bytes * 8;
-        let mut bits = Vec::with_capacity(expected_bits);
-
         let blocks_x = width / 8;
         let blocks_y = height / 8;
+        let total_blocks = blocks_x * blocks_y;
 
+        let mut all_bits = Vec::with_capacity(total_blocks);
+
+        // Read EVERY bit from the entire sub-band
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
-                if bits.len() >= expected_bits {
-                    break;
-                }
-
                 let mut block = [0.0; 64];
                 for r in 0..8 {
                     for c in 0..8 {
@@ -154,30 +155,42 @@ impl WatermarkEngine {
                 }
 
                 self.dct.forward_2d(&mut block);
-                let opt_bit = self.qim.extract_bit(block[self.target_coeff], 0.50);
-                bits.push(opt_bit);
+                all_bits.push(self.qim.extract_bit(block[self.target_coeff], 0.45));
             }
         }
 
-        let mut payload = Vec::with_capacity(expected_bytes);
-        for bit_chunk in bits.chunks_exact(8) {
-            let mut byte = 0u8;
-            let mut valid_byte = true;
-            for (i, &opt_bit) in bit_chunk.iter().enumerate() {
-                if let Some(bit) = opt_bit {
-                    byte |= bit << i;
+        let mut extracted_payloads = Vec::new();
+
+        // Chunk the bits into complete payload packages
+        for bit_chunk in all_bits.chunks(expected_bits) {
+            if bit_chunk.len() < expected_bits {
+                break;
+            }
+
+            let mut payload = Vec::with_capacity(expected_bytes);
+            for byte_chunk in bit_chunk.chunks_exact(8) {
+                let mut byte = 0u8;
+                let mut valid_byte = true;
+
+                for (i, &opt_bit) in byte_chunk.iter().enumerate() {
+                    if let Some(bit) = opt_bit {
+                        byte |= bit << i;
+                    } else {
+                        valid_byte = false;
+                        break;
+                    }
+                }
+
+                if valid_byte {
+                    payload.push(Some(byte));
                 } else {
-                    valid_byte = false;
-                    break;
+                    payload.push(None);
                 }
             }
-            if valid_byte {
-                payload.push(Some(byte));
-            } else {
-                payload.push(None);
-            }
+            extracted_payloads.push(payload);
         }
-        payload
+
+        extracted_payloads
     }
 }
 
@@ -187,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_full_embed_extract_pipeline() {
-        // DWT halves each dimension; HL band is 1/4 of original. Need 80 blocks for 10 bytes.
-        // 80 blocks = 8*10, so HL needs 80x64 min -> original 160x128. Use 352x352 for margin.
+        // DWT halves each dimension; HL band 176x176 = 484 blocks. 10 bytes = 80 bits.
+        // Repetition produces multiple chunks; first chunk should decode correctly.
         let width = 352;
         let height = 352;
         let mut y_channel = vec![128.0; width * height];
@@ -198,9 +211,13 @@ mod tests {
         engine.embed(&mut y_channel, width, height, payload);
 
         let mut y_for_extract = y_channel.clone();
-        let extracted = engine.extract(&mut y_for_extract, width, height, payload.len());
+        let payload_chunks = engine.extract(&mut y_for_extract, width, height, payload.len());
 
-        let extracted_bytes: Vec<u8> = extracted.into_iter().map(|o| o.unwrap()).collect();
+        // At least one chunk should decode to our payload
+        let extracted_bytes: Vec<u8> = payload_chunks[0]
+            .iter()
+            .map(|o| o.unwrap())
+            .collect();
         assert_eq!(&extracted_bytes, payload, "Pipeline failed to extract exact payload");
     }
 }

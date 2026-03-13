@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+crc32fast = "1.3"
 reed-solomon-erasure = "6.0"
 thiserror = "1.0"
 image = "0.25"

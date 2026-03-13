@@ -7,7 +7,7 @@ A blind, compression-resistant, cryptographically verifiable provenance watermar
 - **Blind extraction** — No original image needed; auto-discovers step size
 - **JPEG-resistant** — Survives 75% quality JPEG compression at step size S=45
 - **Cryptographically verifiable** — Embeds P-256 compressed public key (33 bytes)
-- **Reed-Solomon FEC** — 38 data + 20 parity = 58 bytes; recovers from up to 20 corrupted bytes
+- **Reed-Solomon FEC** — 42 data + 16 parity = 58 bytes; recovers from up to 16 corrupted bytes
 - **Hybrid DWT-DCT** — Watermark embedded in HL (horizontal edge) sub-band for invisibility
 
 ## How It Works
@@ -31,9 +31,9 @@ Extract: RGB → YCbCr → DWT → HL band → 8×8 DCT → QIM extract → Reed
 
 4. **QIM (Quantization Index Modulation)** — Embed bit 0: snap to even multiples of step size S. Embed bit 1: snap to odd multiples. Extracts by bucket (even→0, odd→1). Erasure signaling: if a coefficient drifts too close to a boundary, mark as `None` for Reed-Solomon.
 
-5. **Reed-Solomon** — 38 data shards + 20 parity shards = 58 bytes total. Corrects up to 20 erasures.
+5. **Reed-Solomon** — 42 data shards + 16 parity shards = 58 bytes total. Corrects up to 16 erasures.
 
-6. **Binary schema** — 38-byte payload: `version` (1) + `compressed_pubkey` (33) + `asset_id` (4).
+6. **Binary schema** — 42-byte payload: `version` (1) + `compressed_pubkey` (33) + `asset_id` (4) + `CRC32` (4). CRC32 validates integrity; spatial repetition loops the payload across the HL band for redundancy.
 
 ### Real Estate
 
@@ -81,7 +81,7 @@ cargo run --bin watermark-cli -- embed -i photo.jpg -o watermarked.png -k key.pe
 
 ### Extract
 
-Extracts provenance from an image. **No step size needed** — auto-probes `[25, 30, 35, 40, 45, 50]` and returns the first valid result.
+Extracts provenance from an image. **No step size needed** — auto-probes `[25, 30, 35, 40, 45, 50, 55]` and returns the first valid result.
 
 ```bash
 cargo run --bin watermark-cli -- extract -i <input>
@@ -101,7 +101,7 @@ cargo run --bin watermark-cli -- extract -i compressed.jpg
 
 ```
 Loading image from compressed.jpg...
-Probing step sizes [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]...
+Probing step sizes [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0]...
 SUCCESS! Valid Provenance Found (S=45.0):
 Version: 1
 Asset ID: 999
@@ -110,7 +110,7 @@ Public Key (hex): 021dce54e3ec92e10bd0eaa6b47bd5a354ad7007737990fe3983f6ed98f511
 
 ## JPEG Crucible Test
 
-To verify robustness:
+Quick manual test:
 
 ```bash
 # 1. Embed
@@ -124,6 +124,16 @@ cargo run --bin watermark-cli -- extract -i compressed.jpg
 ```
 
 If extraction succeeds, the watermark survives JPEG 75%.
+
+### Full Crucible (Aggressive End-to-End)
+
+Runs 8 torture tests: PNG baseline, JPEG 75%/85%/95%, crop 400×400, crop 360×360, crop+JPEG, resize 70%.
+
+```bash
+./scripts/crucible.sh [image.jpg]
+```
+
+Requires ImageMagick (`magick` or `convert`). **Baseline:** A (PNG) and F (JPEG 95%) must pass. Crop and resize tests may fail due to DWT boundary effects and interpolation—this documents known limits.
 
 ## Building & Testing
 
@@ -146,7 +156,7 @@ cargo run --bin watermark-cli -- extract --help
 blind-watermark/
 ├── watermark-core/     # Library
 │   ├── lib.rs          # PayloadManager (Reed-Solomon)
-│   ├── schema.rs       # ProvenancePayload (38-byte binary layout)
+│   ├── schema.rs       # ProvenancePayload (42-byte: 38 data + 4 CRC32)
 │   ├── image_manager.rs # YCbCr conversion
 │   ├── dwt_manager.rs   # 2D Haar wavelet
 │   ├── transform_manager.rs # 8×8 DCT

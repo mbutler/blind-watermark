@@ -1565,6 +1565,7 @@ dependencies = [
 name = "watermark-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "image",
  "reed-solomon-erasure",
  "rustdct",

@@ -16,6 +16,12 @@ pub enum WatermarkError {
     FecError,
     #[error("Payload is too corrupted to reconstruct")]
     UnrecoverableCorruption,
+    #[error("Image too small. Need at least ~344×344 pixels, got {width}×{height}")]
+    ImageTooSmall { width: usize, height: usize },
+    #[error("Invalid schema: {0}")]
+    InvalidSchema(String),
+    #[error("No valid provenance found at any step size")]
+    NoProvenanceFound,
 }
 
 pub struct PayloadManager {
@@ -96,6 +102,148 @@ impl PayloadManager {
 
         Ok(original_data)
     }
+}
+
+// =============================================================================
+// High-Level Facade (Tauri / Trust Systems Integration)
+// =============================================================================
+
+use image::RgbImage;
+
+pub use schema::ProvenancePayload;
+
+/// Minimum image dimension (each axis) for 58-byte payload. HL band must hold 464 blocks.
+const MIN_IMAGE_DIM: usize = 344;
+
+/// Step sizes probed during extraction when caller does not specify.
+const EXTRACT_STEP_SIZES: [f64; 7] = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0];
+
+/// Embeds provenance into an image in-place. Accepts and mutates an `RgbImage` buffer.
+/// Designed for in-memory pipelines (e.g., load → C2PA inject → watermark → single write).
+pub fn apply_watermark(
+    image: &mut RgbImage,
+    payload: &ProvenancePayload,
+    step_size: f64,
+) -> Result<(), WatermarkError> {
+    let (width, height) = image.dimensions();
+    let width = width as usize;
+    let height = height as usize;
+
+    if width < MIN_IMAGE_DIM || height < MIN_IMAGE_DIM {
+        return Err(WatermarkError::ImageTooSmall { width, height });
+    }
+
+    let payload_manager = PayloadManager::with_params(42, 16)?;
+    let raw_bytes = payload.to_bytes();
+    let robust_payload = payload_manager.encode_payload(&raw_bytes[..])?;
+
+    let mut ycbcr = crate::image_manager::YCbCrImage::from_rgb(image);
+    let engine = crate::embed_manager::WatermarkEngine::new(step_size);
+    engine.embed(
+        &mut ycbcr.y_channel,
+        ycbcr.width as usize,
+        ycbcr.height as usize,
+        &robust_payload,
+    );
+
+    let output = ycbcr.to_rgb();
+    for (dst, src) in image.pixels_mut().zip(output.pixels()) {
+        *dst = *src;
+    }
+
+    Ok(())
+}
+
+/// Tries to decode a 58-byte chunk with phase search (464 bit rotations).
+/// Cropping misaligns the block grid; one rotation yields the correct payload.
+fn try_decode_chunk_with_phase_search(
+    chunk: &[Option<u8>],
+    payload_manager: &PayloadManager,
+) -> Option<ProvenancePayload> {
+    const BITS_PER_PAYLOAD: usize = 464; // 58 bytes * 8
+
+    // Expand 58 bytes -> 464 bits (LSB first, matching embed)
+    let mut bits = Vec::with_capacity(BITS_PER_PAYLOAD);
+    for opt_byte in chunk.iter().take(58) {
+        if let Some(b) = opt_byte {
+            for i in 0..8 {
+                bits.push(Some((b >> i) & 1));
+            }
+        } else {
+            for _ in 0..8 {
+                bits.push(None);
+            }
+        }
+    }
+    if bits.len() < BITS_PER_PAYLOAD {
+        return None;
+    }
+
+    for phase in 0..BITS_PER_PAYLOAD {
+        let mut rotated = Vec::with_capacity(58);
+        for byte_idx in 0..58 {
+            let mut byte_val: Option<u8> = Some(0);
+            for bit_idx in 0..8 {
+                let pos = (phase + byte_idx * 8 + bit_idx) % BITS_PER_PAYLOAD;
+                if let Some(Some(b)) = bits.get(pos).copied() {
+                    if let Some(ref mut v) = byte_val {
+                        *v |= b << bit_idx;
+                    }
+                } else {
+                    byte_val = None;
+                    break;
+                }
+            }
+            rotated.push(byte_val);
+        }
+
+        if let Ok(raw_bytes) = payload_manager.decode_payload(&rotated) {
+            if let Ok(provenance) = ProvenancePayload::from_bytes(&raw_bytes) {
+                if provenance.version == 1 {
+                    return Some(provenance);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extracts provenance from an image. Does not mutate the input; clones internally for
+/// step-size probing. Auto-probes common step sizes [25, 30, 35, 40, 45, 50, 55].
+/// Phase search handles cropped images where block grid is misaligned.
+/// Returns `(ProvenancePayload, step_size)` where `step_size` is the value that succeeded.
+pub fn extract_watermark(
+    image: &RgbImage,
+) -> Result<(ProvenancePayload, f64), WatermarkError> {
+    let (width, height) = image.dimensions();
+    let width = width as usize;
+    let height = height as usize;
+
+    if width < MIN_IMAGE_DIM || height < MIN_IMAGE_DIM {
+        return Err(WatermarkError::ImageTooSmall { width, height });
+    }
+
+    let payload_manager = PayloadManager::with_params(42, 16)?;
+    let expected_bytes = payload_manager.total_payload_bytes();
+    let ycbcr = crate::image_manager::YCbCrImage::from_rgb(image);
+
+    for &step_size in &EXTRACT_STEP_SIZES {
+        let engine = crate::embed_manager::WatermarkEngine::new(step_size);
+        let mut y_mut = ycbcr.y_channel.clone();
+        let payload_chunks = engine.extract(&mut y_mut, width, height, expected_bytes);
+
+        // Try each spatially repeated chunk until CRC32 clicks.
+        // Phase search: cropping misaligns block grid; try all 464 bit-offset rotations.
+        for chunk in payload_chunks {
+            if let Some(provenance) =
+                try_decode_chunk_with_phase_search(&chunk, &payload_manager)
+            {
+                return Ok((provenance, step_size));
+            }
+        }
+    }
+
+    Err(WatermarkError::NoProvenanceFound)
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ A blind, compression-resistant, cryptographically verifiable provenance watermar
 - **JPEG-resistant** — Survives 75% quality JPEG compression at step size S=45
 - **Cryptographically verifiable** — Embeds P-256 compressed public key (33 bytes)
 - **Reed-Solomon FEC** — 42 data + 16 parity = 58 bytes; recovers from up to 16 corrupted bytes
+- **Spatial repetition** — Payload looped across the HL band; large images hold ~40–50 redundant copies
 - **Hybrid DWT-DCT** — Watermark embedded in HL (horizontal edge) sub-band for invisibility
 
 ## How It Works
@@ -37,7 +38,7 @@ Extract: RGB → YCbCr → DWT → HL band → 8×8 DCT → QIM extract → Reed
 
 ### Real Estate
 
-The HL band is ¼ of the original pixels. Each 8×8 block embeds 1 bit. For 58 bytes (464 bits), the **original image must be at least ~344×344 pixels**. Smaller images will run out of space.
+The HL band is ¼ of the original pixels. Each 8×8 block embeds 1 bit. With **spatial repetition**, the payload is stamped across the entire HL band (loops via `block_index % 464`); larger images hold many redundant copies (e.g. 1080p ≈ 40–50 copies). The **original image must be at least ~344×344 pixels** for extraction to have one full 464-block chunk. Extraction tries each chunk until CRC32 validates.
 
 ## Requirements
 

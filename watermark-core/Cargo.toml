@@ -1,0 +1,11 @@
+[package]
+name = "watermark-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reed-solomon-erasure = "6.0"
+thiserror = "1.0"
+image = "0.25"
+rustdct = "0.7"
+rustfft = "6.1"

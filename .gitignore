@@ -1,0 +1,23 @@
+# Secrets and keys (never commit)
+*.pem
+key.pem
+key_pkcs8.pem
+*.key
+.env
+.env.*
+secrets.*
+*.secret
+
+# Rust
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

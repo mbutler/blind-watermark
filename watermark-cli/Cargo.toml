@@ -1,0 +1,11 @@
+[package]
+name = "watermark-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+image = "0.25"
+p256 = { version = "0.13", features = ["pem", "pkcs8"] }
+hex = "0.4"
+watermark-core = { path = "../watermark-core" }

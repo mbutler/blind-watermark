@@ -106,7 +106,8 @@ fn main() {
             let mut found = false;
             for &step_size in &STEP_SIZES {
                 let engine = WatermarkEngine::new(step_size);
-                let extracted = engine.extract(&ycbcr.y_channel, width, height, expected_bytes);
+                let mut y_mut = ycbcr.y_channel.clone();
+                let extracted = engine.extract(&mut y_mut, width, height, expected_bytes);
 
                 if let Ok(raw_bytes) = payload_manager.decode_payload(&extracted) {
                     if let Ok(provenance) = ProvenancePayload::from_bytes(&raw_bytes) {

@@ -1,5 +1,6 @@
-use crate::transform_manager::BlockDctEngine;
+use crate::dwt_manager::DwtEngine;
 use crate::qim_manager::QimEngine;
+use crate::transform_manager::BlockDctEngine;
 
 pub struct WatermarkEngine {
     dct: BlockDctEngine,
@@ -12,15 +13,78 @@ impl WatermarkEngine {
         Self {
             dct: BlockDctEngine::new(),
             qim: QimEngine::new(step_size),
-            // Index 27 is a mid-frequency AC coefficient [row 3, col 3].
-            // It balances visual imperceptibility with survival against JPEG compression.
             target_coeff: 27,
         }
     }
 
-    /// Embeds a byte payload into the Y channel. Modifies the channel in-place.
+    /// Embeds a byte payload into the Y channel. Wraps in DWT, targets HL band.
     pub fn embed(&self, y_channel: &mut [f64], width: usize, height: usize, payload: &[u8]) {
-        // Break payload down into a flat vector of bits (0s and 1s)
+        let w = width & !1;
+        let h = height & !1;
+        let half_w = w / 2;
+        let half_h = h / 2;
+
+        // 1. Convert Spatial Image to DWT Frequencies
+        DwtEngine::forward_2d(y_channel, width, height);
+
+        // 2. Extract the HL Sub-band (Top-Right Quadrant)
+        let mut hl_band = vec![0.0; half_w * half_h];
+        for y in 0..half_h {
+            for x in 0..half_w {
+                hl_band[y * half_w + x] = y_channel[y * width + (half_w + x)];
+            }
+        }
+
+        // 3. Run DCT-QIM embedding on the HL band only
+        self.embed_dct_blocks(&mut hl_band, half_w, half_h, payload);
+
+        // 4. Write the watermarked HL band back into the DWT grid
+        for y in 0..half_h {
+            for x in 0..half_w {
+                y_channel[y * width + (half_w + x)] = hl_band[y * half_w + x];
+            }
+        }
+
+        // 5. Reconstruct the image back to Spatial Pixels
+        DwtEngine::inverse_2d(y_channel, width, height);
+    }
+
+    /// Extracts payload from the Y channel. Runs DWT, reads from HL band.
+    /// Requires &mut because it performs the forward DWT in place.
+    pub fn extract(
+        &self,
+        y_channel: &mut [f64],
+        width: usize,
+        height: usize,
+        expected_bytes: usize,
+    ) -> Vec<Option<u8>> {
+        let w = width & !1;
+        let h = height & !1;
+        let half_w = w / 2;
+        let half_h = h / 2;
+
+        // 1. Convert Spatial Image to DWT Frequencies
+        DwtEngine::forward_2d(y_channel, width, height);
+
+        // 2. Extract the HL Sub-band
+        let mut hl_band = vec![0.0; half_w * half_h];
+        for y in 0..half_h {
+            for x in 0..half_w {
+                hl_band[y * half_w + x] = y_channel[y * width + (half_w + x)];
+            }
+        }
+
+        // 3. Extract payload from the HL band
+        self.extract_dct_blocks(&hl_band, half_w, half_h, expected_bytes)
+    }
+
+    fn embed_dct_blocks(
+        &self,
+        band: &mut [f64],
+        width: usize,
+        height: usize,
+        payload: &[u8],
+    ) {
         let mut bits = Vec::with_capacity(payload.len() * 8);
         for byte in payload {
             for i in 0..8 {
@@ -35,46 +99,36 @@ impl WatermarkEngine {
         for by in 0..blocks_y {
             for bx in 0..blocks_x {
                 if bit_index >= bits.len() {
-                    return; // All bits have been embedded
+                    return;
                 }
 
                 let mut block = [0.0; 64];
-
-                // 1. Extract the 8x8 spatial block from the flat Y channel
                 for r in 0..8 {
                     for c in 0..8 {
                         let px = (by * 8 + r) * width + (bx * 8 + c);
-                        block[r * 8 + c] = y_channel[px];
+                        block[r * 8 + c] = band[px];
                     }
                 }
 
-                // 2. Transform into Frequency Domain
                 self.dct.forward_2d(&mut block);
-
-                // 3. Embed the bit using QIM
                 block[self.target_coeff] =
                     self.qim.embed_bit(block[self.target_coeff], bits[bit_index]);
                 bit_index += 1;
-
-                // 4. Transform back to Spatial Domain
                 self.dct.inverse_2d(&mut block);
 
-                // 5. Write the modified block back into the Y channel
                 for r in 0..8 {
                     for c in 0..8 {
                         let px = (by * 8 + r) * width + (bx * 8 + c);
-                        y_channel[px] = block[r * 8 + c];
+                        band[px] = block[r * 8 + c];
                     }
                 }
             }
         }
     }
 
-    /// Extracts bits from the Y channel and reassembles them into a byte payload.
-    /// Uses erasure signaling: if any bit in a byte is uncertain, the whole byte is marked None.
-    pub fn extract(
+    fn extract_dct_blocks(
         &self,
-        y_channel: &[f64],
+        band: &[f64],
         width: usize,
         height: usize,
         expected_bytes: usize,
@@ -92,44 +146,37 @@ impl WatermarkEngine {
                 }
 
                 let mut block = [0.0; 64];
-
                 for r in 0..8 {
                     for c in 0..8 {
                         let px = (by * 8 + r) * width + (bx * 8 + c);
-                        block[r * 8 + c] = y_channel[px];
+                        block[r * 8 + c] = band[px];
                     }
                 }
 
                 self.dct.forward_2d(&mut block);
-
-                // Extract with a 50% tolerance threshold (marks uncertain bits as erasures)
                 let opt_bit = self.qim.extract_bit(block[self.target_coeff], 0.50);
                 bits.push(opt_bit);
             }
         }
 
-        // Reassemble bits into bytes; one bad bit marks the whole byte as an erasure
         let mut payload = Vec::with_capacity(expected_bytes);
         for bit_chunk in bits.chunks_exact(8) {
             let mut byte = 0u8;
             let mut valid_byte = true;
-
             for (i, &opt_bit) in bit_chunk.iter().enumerate() {
                 if let Some(bit) = opt_bit {
                     byte |= bit << i;
                 } else {
                     valid_byte = false;
-                    break; // One bad bit ruins the byte
+                    break;
                 }
             }
-
             if valid_byte {
                 payload.push(Some(byte));
             } else {
-                payload.push(None); // Signal the erasure to Reed-Solomon
+                payload.push(None);
             }
         }
-
         payload
     }
 }
@@ -140,27 +187,20 @@ mod tests {
 
     #[test]
     fn test_full_embed_extract_pipeline() {
-        let engine = WatermarkEngine::new(20.0);
-        let width = 128;  // 16 blocks across
-        let height = 128; // 16 blocks down (256 blocks total)
-
-        // Create a fake Y-channel (flat gray image)
+        // DWT halves each dimension; HL band is 1/4 of original. Need 80 blocks for 10 bytes.
+        // 80 blocks = 8*10, so HL needs 80x64 min -> original 160x128. Use 352x352 for margin.
+        let width = 352;
+        let height = 352;
         let mut y_channel = vec![128.0; width * height];
-
-        // A 10-byte dummy payload (requires 80 blocks to embed)
         let payload = b"HELLOWORLD";
 
-        // Embed
+        let engine = WatermarkEngine::new(20.0);
         engine.embed(&mut y_channel, width, height, payload);
 
-        // Extract
-        let extracted = engine.extract(&y_channel, width, height, payload.len());
+        let mut y_for_extract = y_channel.clone();
+        let extracted = engine.extract(&mut y_for_extract, width, height, payload.len());
 
-        // Verify all bytes survived the roundtrip across 80 different frequency blocks
         let extracted_bytes: Vec<u8> = extracted.into_iter().map(|o| o.unwrap()).collect();
-        assert_eq!(
-            &extracted_bytes, payload,
-            "Pipeline failed to extract exact payload"
-        );
+        assert_eq!(&extracted_bytes, payload, "Pipeline failed to extract exact payload");
     }
 }

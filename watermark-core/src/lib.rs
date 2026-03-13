@@ -1,3 +1,4 @@
+pub mod dwt_manager;
 pub mod image_manager;
 pub mod schema;
 pub mod transform_manager;
